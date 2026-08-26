@@ -183,7 +183,7 @@ const SECTIONS = {
         rsel("precision", "Precision", PRECISION_OPTS),
         rsel("temp_step", "Temperature Step", TEMP_STEP_OPTS),
         rsel("celsius", "Temperature Unit", CELSIUS_OPTS),
-        f("model", "AC Model Override (optional, -1 = auto)"),
+        f("hvac_model", "AC Model Override (optional, -1 = auto)"),
         n("away_temp", "Away Temp (0 = Disabled)", 0, 35, 0.5, "°"),
       ],
     },
@@ -464,7 +464,7 @@ const FIELD_DEFAULTS = {
   temp_step:               "0.5",
   celsius:                 "on",
   // Climate — behavior
-  model:                   "-1",
+  hvac_model:              "-1",
   sleep:                   "-1",
   away_temp:               0,
   default_swingv:          "off",

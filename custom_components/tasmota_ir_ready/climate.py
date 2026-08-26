@@ -160,6 +160,130 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Teknopoint GZ055BE1 Auto-mode support
+#
+# The GZ055BE1 (Model 2) uses a 112-bit TEKNOPOINT/TCL112AC frame.  The
+# generic IRHVAC abstraction in Tasmota/IRremoteESP8266 can decode the state,
+# but its generic state builder does not reproduce the Auto-mode temperature
+# nibbles used by this particular remote.  These values are taken from
+# physical-remote captures and are deliberately explicit.
+# ---------------------------------------------------------------------------
+
+_GZ055BE1_VENDOR_NAMES = {"TCL112AC", "TEKNOPOINT"}
+_GZ055BE1_MODEL_NAMES = {"2", "GZ055BE1"}
+
+# Auto mode on this appliance only accepts these five target temperatures.
+# Byte 7 is the complete captured value, not merely the normal TCL
+# temperature nibble.
+_GZ055BE1_AUTO_TEMP_BYTES = {
+    22: 0xA9,
+    23: 0x28,
+    24: 0x07,
+    25: 0x16,
+    26: 0x95,
+}
+
+# Byte 8 bits 0..2 are the fan selector in the native TCL112 representation.
+_GZ055BE1_FAN_BYTES = {
+    "auto": 0x00,
+    "low": 0x02,
+    "medium": 0x03,
+    "high": 0x05,
+    "max": 0x05,
+}
+
+# Byte 8 bits 3..5 are vertical swing. These are the native values used by
+# IRremoteESP8266 for TCL112/TEKNOPOINT.
+_GZ055BE1_SWINGV_BYTES = {
+    "off": 0x00,
+    "highest": 0x08,
+    "high": 0x10,
+    "middle": 0x18,
+    "low": 0x20,
+    "lowest": 0x28,
+    "auto": 0x38,
+}
+
+_GZ055BE1_AUTO_BASE = bytes.fromhex(
+    "23CB26010064089500000000081E"
+)
+
+
+def _is_gz055be1(vendor: str, model) -> bool:
+    """Return True for the Teknopoint GZ055BE1 profile."""
+    return (
+        str(vendor).upper() in _GZ055BE1_VENDOR_NAMES
+        and str(model).upper() in _GZ055BE1_MODEL_NAMES
+    )
+
+
+def _gz055be1_auto_frame(
+    power: str,
+    temperature: float,
+    fan_mode: str,
+    swingv: str,
+    swingh: str,
+    light: str,
+    previous_raw: bytes | None = None,
+) -> bytes:
+    """Build an exact 14-byte GZ055BE1 Auto-mode TEKNOPOINT state."""
+    temp = int(round(float(temperature)))
+    if temp not in _GZ055BE1_AUTO_TEMP_BYTES:
+        raise ValueError(
+            f"GZ055BE1 Auto mode only supports 22-26C, got {temperature}"
+        )
+
+    fan = str(fan_mode).lower()
+    if fan not in _GZ055BE1_FAN_BYTES:
+        raise ValueError(f"Unsupported GZ055BE1 Auto fan mode: {fan_mode}")
+
+    sv = str(swingv or "off").lower()
+    if sv not in _GZ055BE1_SWINGV_BYTES:
+        raise ValueError(f"Unsupported GZ055BE1 vertical swing: {swingv}")
+
+    sh = str(swingh or "off").lower()
+    if sh not in ("off", "auto"):
+        # GZ055BE1 horizontal fixed positions are not represented by the
+        # generic IRHVAC model. Preserve the last captured raw state when
+        # possible; otherwise fall back to horizontal off.
+        sh = "off"
+
+    # Start from the last real GZ055BE1 frame when available. This preserves
+    # fields we don't expose in the HA climate UI (timers/reserved bits).
+    # Otherwise use the known-good 26C Auto baseline.
+    frame = bytearray(previous_raw if previous_raw and len(previous_raw) == 14
+                      else _GZ055BE1_AUTO_BASE)
+
+    # Fixed protocol header / normal message / Auto mode / no timers.
+    frame[0:5] = bytes.fromhex("23CB260100")
+    frame[6] = 0x08  # Auto
+
+    # Byte 5: bit 2 = power, bit 6 = display/light.
+    b5 = frame[5]
+    b5 = (b5 & ~0x04) | (0x04 if str(power).lower() == "on" else 0)
+    b5 = (b5 & ~0x40) | (0x40 if str(light).lower() == "off" else 0)
+    frame[5] = b5
+
+    # Captured Auto-mode temperature representation.
+    frame[7] = _GZ055BE1_AUTO_TEMP_BYTES[temp]
+
+    # Byte 8: fan bits + vertical swing bits. Clear timer indicator.
+    frame[8] = _GZ055BE1_FAN_BYTES[fan] | _GZ055BE1_SWINGV_BYTES[sv]
+    frame[8] &= 0x3F
+
+    # Horizontal swing is bit 3 of byte 12.
+    frame[12] = (frame[12] & ~0x08) | (0x08 if sh == "auto" else 0x00)
+
+    # This is the Teknopoint/GZ055BE1 variant, not the TCL variant.
+    frame[12] &= ~0x80
+
+    # The last byte is the 8-bit checksum used by TCL112/TEKNOPOINT.
+    frame[13] = sum(frame[:13]) & 0xFF
+    return bytes(frame)
+
+
+
 DATA_SERVICES_REGISTERED = f"{DATA_KEY}.services_registered"
 
 SUPPORT_FLAGS = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE
@@ -457,7 +581,7 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
         self._quiet = config[CONF_QUIET].lower()
         self._turbo = config[CONF_TURBO].lower()
         self._econo = config[CONF_ECONO].lower()
-        self._model = config[CONF_MODEL]
+        self._model = config.get("model", config.get(CONF_MODEL, DEFAULT_CONF_MODEL))
         self._celsius = config[CONF_CELSIUS]
         self._light = config[CONF_LIGHT].lower()
         self._filter = config[CONF_FILTER].lower()
@@ -485,6 +609,7 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
         self._use_track_state_change_event = False
         self._unsubscribes = []
         self._linked_entities: list = []
+        self._gz055be1_last_raw: bytes | None = None
 
         self.availability_topic = config.get(CONF_AVAILABILITY_TOPIC)
         if self.availability_topic is None:
@@ -788,9 +913,24 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
             _LOGGER.debug(json_payload)
 
             # If listening to `tele`, result looks like: {"IrReceived":{"Protocol":"XXX", ... ,"IRHVAC":{ ... }}}
-            # we want to extract the data.
+            # we want to extract the data. Keep the native 14-byte frame for
+            # GZ055BE1 so Auto-mode commands can preserve fields that aren't
+            # exposed by the generic IRHVAC abstraction.
             if "IrReceived" in json_payload:
-                json_payload = json_payload["IrReceived"]
+                ir_received = json_payload["IrReceived"]
+                protocol = str(ir_received.get("Protocol", "")).upper()
+                data = ir_received.get("Data")
+                if (
+                    protocol in _GZ055BE1_VENDOR_NAMES
+                    and isinstance(data, str)
+                ):
+                    try:
+                        raw = bytes.fromhex(data.removeprefix("0x"))
+                        if len(raw) == 14 and raw[:3] == bytes.fromhex("23CB26"):
+                            self._gz055be1_last_raw = raw
+                    except ValueError:
+                        pass
+                json_payload = ir_received
 
             # By now the payload must include an `IRHVAC` field.
             if "IRHVAC" not in json_payload:
@@ -970,6 +1110,12 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
         if hvac_mode is not None:
             await self.set_mode(hvac_mode)
 
+        if (
+            self._is_gz055be1_auto()
+            and self._attr_hvac_mode == HVACMode.AUTO
+        ):
+            temperature = min(26, max(22, round(float(temperature))))
+
         self._attr_target_temperature = temperature
         if not self._attr_hvac_mode == HVACMode.OFF:
             self.power_mode = STATE_ON
@@ -1137,22 +1283,26 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
     async def async_send_cmd(self):
         await self.send_ir()
 
-    @cached_property
+    def _is_gz055be1_auto(self):
+        """Return True when this entity is the GZ055BE1 Auto profile."""
+        return _is_gz055be1(self._vendor, self._model)
+
+    @property
     def min_temp(self):
-        """Return the minimum temperature."""
+        """Return the minimum target temperature."""
+        if self._is_gz055be1_auto() and self._attr_hvac_mode == HVACMode.AUTO:
+            return 22
         if self._min_temp:
             return self._min_temp
-
-        # get default temp from super class
         return super().min_temp
 
-    @cached_property
+    @property
     def max_temp(self):
-        """Return the maximum temperature."""
+        """Return the maximum target temperature."""
+        if self._is_gz055be1_auto() and self._attr_hvac_mode == HVACMode.AUTO:
+            return 26
         if self._max_temp:
             return self._max_temp
-
-        # Get default temp from super class
         return super().max_temp
 
     async def _async_sensor_changed(
@@ -1259,10 +1409,76 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
             self._attr_hvac_mode = self._last_on_mode = hvac_mode
             self._enabled = True
             self.power_mode = STATE_ON
+            if self._is_gz055be1_auto() and hvac_mode == HVACMode.AUTO:
+                current = float(self._attr_target_temperature or 24)
+                self._attr_target_temperature = min(26, max(22, round(current)))
 
     async def send_ir(self):
         """Send the payload to tasmota mqtt topic."""
         fan_speed = self._fan_mode_payload.get(self.fan_mode, self.fan_mode)
+
+        # GZ055BE1 Auto mode: bypass the generic IRHVAC builder and send the
+        # exact TEKNOPOINT 112-bit state. Cool/Dry/Fan/etc. continue through
+        # the existing IRHVAC path unchanged.
+        if (
+            self._is_gz055be1_auto()
+            and self._attr_hvac_mode == HVACMode.AUTO
+        ):
+            # Translate the HA combined swing selector into the native
+            # vertical/horizontal fields before building the raw frame.
+            auto_swingv = "off"
+            auto_swingh = "off"
+            swing_mode = self._attr_swing_mode
+            if swing_mode == SWING_BOTH:
+                auto_swingv = "auto"
+                auto_swingh = "auto"
+            elif swing_mode == SWING_VERTICAL:
+                auto_swingv = "auto"
+            elif swing_mode == SWING_HORIZONTAL:
+                auto_swingh = "auto"
+            elif swing_mode in SWING_VERTICAL_POSITIONS:
+                auto_swingv = swing_mode
+            elif swing_mode in SWING_HORIZONTAL_POSITIONS:
+                auto_swingh = SWING_HORIZONTAL_PAYLOAD[swing_mode]
+
+            try:
+                frame = _gz055be1_auto_frame(
+                    power=self.power_mode,
+                    temperature=self._attr_target_temperature,
+                    fan_mode=fan_speed,
+                    swingv=auto_swingv,
+                    swingh=auto_swingh,
+                    light=self._light,
+                    previous_raw=self._gz055be1_last_raw,
+                )
+            except ValueError as ex:
+                _LOGGER.error("Unable to build GZ055BE1 Auto frame: %s", ex)
+                return
+
+            if float(self._mqtt_delay) != float(DEFAULT_MQTT_DELAY):
+                await asyncio.sleep(float(self._mqtt_delay))
+
+            # The configured topic normally ends in /IRHVAC. Tasmota's raw
+            # sender lives at the same command prefix with /IRSend.
+            irsend_topic = (
+                self.topic.rsplit("/", 1)[0] + "/IRSend"
+                if "/" in self.topic
+                else self.topic
+            )
+            payload = json.dumps(
+                {
+                    "Protocol": "TEKNOPOINT",
+                    "Bits": 112,
+                    "Data": "0x" + frame.hex().upper(),
+                }
+            )
+            _LOGGER.debug(
+                "Sending GZ055BE1 Auto raw frame: %s",
+                frame.hex().upper(),
+            )
+            await mqtt.async_publish(self.hass, irsend_topic, payload)
+            self.async_schedule_update_ha_state()
+            return
 
         # Set the swing mode - default off
         self._swingv = STATE_OFF if self._fix_swingv is None else self._fix_swingv

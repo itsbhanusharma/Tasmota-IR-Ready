@@ -218,6 +218,11 @@ def _is_gz055be1(vendor: str, model) -> bool:
     )
 
 
+def _is_sleep_enabled(value) -> bool:
+    """Return True when the IRHVAC Sleep field represents an active timer."""
+    return str(value).lower() not in {"-1", "off", "none", ""}
+
+
 def _gz055be1_auto_frame(
     power: str,
     temperature: float,
@@ -610,6 +615,11 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
         self._unsubscribes = []
         self._linked_entities: list = []
         self._gz055be1_last_raw: bytes | None = None
+        # Normal state saved immediately before GZ055BE1 Super is enabled.
+        # The AC itself also restores this state; this copy exists so HA can
+        # avoid replacing the user's normal state with Super's forced 16C/Max/
+        # both-swing values when a Super frame is received.
+        self._gz055be1_super_saved_state: dict | None = None
 
         self.availability_topic = config.get(CONF_AVAILABILITY_TOPIC)
         if self.availability_topic is None:
@@ -938,7 +948,17 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
 
             payload = json_payload["IRHVAC"]
 
-            if payload["Vendor"] == self._vendor:
+            payload_vendor = str(payload.get("Vendor", "")).upper()
+            payload_model = payload.get("Model")
+            vendor_matches = payload_vendor == str(self._vendor).upper()
+            if not vendor_matches and _is_gz055be1(payload_vendor, payload_model) and self._is_gz055be1_auto():
+                # GZ055BE1 frames are seen in the wild as either TCL112AC/
+                # GZ055BE1 or TEKNOPOINT/2. Treat those two names as the
+                # same appliance profile so received IR remains authoritative
+                # regardless of which alias was used during configuration.
+                vendor_matches = True
+
+            if vendor_matches:
                 # All values in the payload are Optional
                 prev_power = self.power_mode
                 if "Power" in payload:
@@ -948,7 +968,7 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
                     # Some vendors send/receive mode as fan instead of fan_only
                     if self._attr_hvac_mode == HVACAction.FAN:
                         self._attr_hvac_mode = HVACMode.FAN_ONLY
-                if "Temp" in payload:
+                if "Temp" in payload and not (self._is_gz055be1_auto() and self._turbo == "on"):
                     if payload["Temp"] > 0:
                         if not (self.power_mode == STATE_OFF and self._ignore_off_temp):
                             self._attr_target_temperature = payload["Temp"]
@@ -957,7 +977,23 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
                 if "Quiet" in payload:
                     self._quiet = payload["Quiet"].lower()
                 if "Turbo" in payload:
-                    self._turbo = payload["Turbo"].lower()
+                    received_turbo = str(payload["Turbo"]).lower()
+                    if self._is_gz055be1_auto() and received_turbo == "on" and self._turbo != "on":
+                        self._gz055be1_super_saved_state = {
+                            "temperature": self._attr_target_temperature,
+                            "fan_mode": self._attr_fan_mode,
+                            "swing_mode": self._attr_swing_mode,
+                        }
+                    self._turbo = received_turbo
+                    if self._is_gz055be1_auto() and received_turbo == "off" and self._gz055be1_super_saved_state:
+                        saved = self._gz055be1_super_saved_state
+                        if saved.get("temperature") is not None:
+                            self._attr_target_temperature = saved["temperature"]
+                        if saved.get("fan_mode") is not None:
+                            self._attr_fan_mode = saved["fan_mode"]
+                        if saved.get("swing_mode") is not None:
+                            self._attr_swing_mode = saved["swing_mode"]
+                        self._gz055be1_super_saved_state = None
                 if "Econo" in payload:
                     self._econo = payload["Econo"].lower()
                 if "Light" in payload:
@@ -970,18 +1006,18 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
                     self._beep = payload["Beep"].lower()
                 if "Sleep" in payload:
                     self._sleep = payload["Sleep"]
-                if "SwingV" in payload:
+                if "SwingV" in payload and not (self._is_gz055be1_auto() and self._turbo == "on"):
                     self._swingv = payload["SwingV"].lower()
                     if self._swingv != "auto":
                         self._fix_swingv = self._swingv
-                if "SwingH" in payload:
+                if "SwingH" in payload and not (self._is_gz055be1_auto() and self._turbo == "on"):
                     self._swingh = payload["SwingH"].lower()
                     if self._swingh != "auto":
                         self._fix_swingh = self._swingh
 
                 self._attr_swing_mode = self._swing_mode_from_payload()
 
-                if "FanSpeed" in payload:
+                if "FanSpeed" in payload and not (self._is_gz055be1_auto() and self._turbo == "on"):
                     fan_mode = payload["FanSpeed"].lower()
                     self._attr_fan_mode = self._fan_mode_from_payload(fan_mode)
                     _LOGGER.debug(self._attr_fan_mode)
@@ -1102,6 +1138,9 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
 
     async def async_set_temperature(self, **kwargs):
         """Set new target temperature."""
+        if self._gz055be1_super_active():
+            _LOGGER.debug("Ignoring temperature change while GZ055BE1 Super is active")
+            return
         temperature = kwargs.get(ATTR_TEMPERATURE)
         hvac_mode = kwargs.get(ATTR_HVAC_MODE)
         if temperature is None:
@@ -1123,6 +1162,9 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
 
     async def async_set_fan_mode(self, fan_mode):
         """Set new target fan mode."""
+        if self._gz055be1_super_active():
+            _LOGGER.debug("Ignoring fan change while GZ055BE1 Super is active")
+            return
         if fan_mode not in (self._attr_fan_modes or []):
             # tweak for some ELECTRA_AC devices
             if self.use_electra_tweak:
@@ -1153,6 +1195,9 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
 
     async def async_set_swing_mode(self, swing_mode):
         """Set new target swing operation."""
+        if self._gz055be1_super_active():
+            _LOGGER.debug("Ignoring swing change while GZ055BE1 Super is active")
+            return
         if swing_mode not in (self._attr_swing_modes or []):
             _LOGGER.error(
                 "Invalid swing mode selected. Got '%s'. Allowed modes are:", swing_mode
@@ -1182,15 +1227,36 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
         """Set new target econo mode."""
         if econo not in ON_OFF_LIST:
             return
+        if self._gz055be1_super_active() and econo.lower() == "on":
+            _LOGGER.debug("Ignoring Eco enable while GZ055BE1 Super is active")
+            return
         self._econo = econo.lower()
+        if self._econo == "on" and _is_sleep_enabled(self._sleep):
+            # The physical remote makes Eco and Sleep mutually exclusive.
+            self._sleep = "-1"
         self._state_mode = state_mode
         await self.async_send_cmd()
 
     async def async_set_turbo(self, turbo, state_mode):
-        """Set new target turbo mode."""
+        """Set new target turbo/Super mode.
+
+        For GZ055BE1 this is an AC-native override. We deliberately do not
+        modify temperature, fan speed, or swing here; the AC applies the
+        Super settings itself and restores its previous state on Super OFF.
+        """
         if turbo not in ON_OFF_LIST:
             return
-        self._turbo = turbo.lower()
+        turbo = turbo.lower()
+        if self._is_gz055be1_auto():
+            # Super is not a supported Feel/Auto feature on this remote.
+            _LOGGER.debug("Ignoring Super change in GZ055BE1 Feel/Auto mode")
+            return
+        if turbo == "on":
+            # Super cancels Sleep. Eco is also not available while Super is
+            # active, so clear it before entering the override.
+            self._sleep = "-1"
+            self._econo = "off"
+        self._turbo = turbo
         self._state_mode = state_mode
         await self.async_send_cmd()
 
@@ -1236,12 +1302,22 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
 
     async def async_set_sleep(self, sleep, state_mode):
         """Set new target sleep mode."""
-        self._sleep = sleep.lower()
+        sleep = sleep.lower()
+        if self._gz055be1_super_active() and _is_sleep_enabled(sleep):
+            _LOGGER.debug("Ignoring Sleep enable while GZ055BE1 Super is active")
+            return
+        self._sleep = sleep
+        if _is_sleep_enabled(self._sleep):
+            # The physical remote makes Sleep and Eco mutually exclusive.
+            self._econo = "off"
         self._state_mode = state_mode
         await self.async_send_cmd()
 
     async def async_set_swingv(self, swingv, state_mode):
         """Set new target swingv."""
+        if self._gz055be1_super_active():
+            _LOGGER.debug("Ignoring vertical swing change while GZ055BE1 Super is active")
+            return
         self._swingv = swingv.lower()
         if self._swingv != "auto":
             self._fix_swingv = self._swingv
@@ -1262,6 +1338,9 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
 
     async def async_set_swingh(self, swingh, state_mode):
         """Set new target swingh."""
+        if self._gz055be1_super_active():
+            _LOGGER.debug("Ignoring horizontal swing change while GZ055BE1 Super is active")
+            return
         self._swingh = swingh.lower()
         if self._swingh != "auto":
             self._fix_swingh = self._swingh
@@ -1286,6 +1365,16 @@ class TasmotaIrhvac(RestoreEntity, ClimateEntity):
     def _is_gz055be1_auto(self):
         """Return True when this entity is the GZ055BE1 Auto profile."""
         return _is_gz055be1(self._vendor, self._model)
+
+    def _gz055be1_super_active(self) -> bool:
+        """Return True while the GZ055BE1 is in its Super/Turbo override.
+
+        Super is an AC-native override: the appliance temporarily forces its
+        own temperature/fan/swing values and restores the previous cooling
+        state when Super is disabled. Do not overwrite those values while the
+        override is active.
+        """
+        return _is_gz055be1(self._vendor, self._model) and self._turbo == "on"
 
     @property
     def min_temp(self):

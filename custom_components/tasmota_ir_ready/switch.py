@@ -69,6 +69,14 @@ async def async_setup_entry(
             _LOGGER.warning("Unknown feature key '%s' in toggle list — skipped.", key)
             continue
         label, climate_attr, method_name, kwarg_name, turn_on_val, turn_off_val, on_check_val, icon = feature
+        # The GZ055BE1 physical remote calls Turbo "Super". Keep the generic
+        # feature key/service as Turbo for compatibility, but present the
+        # appliance's actual terminology in Home Assistant.
+        if key == "Turbo" and (
+            str(config.get("vendor", "")).upper() in {"TCL112AC", "TEKNOPOINT"}
+            and str(config.get("hvac_model", config.get("model", ""))).upper() in {"GZ055BE1", "2"}
+        ):
+            label = "Super"
         switches.append(
             TasmotaIrhvacSwitch(
                 hass=hass,
